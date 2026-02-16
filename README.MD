@@ -1,5 +1,9 @@
 # vswitch
 
+Create many virtual switch for clients to connect to. Once they connected, they are virtually in the same network. IP addresses are auto assigned (or you can manually assign). 
+
+You can also bridge multiple virtual switches on the server side!
+
 `vswitch` is a Linux TAP-based L2 virtual switch and lightweight VPN dataplane.
 
 It combines:
