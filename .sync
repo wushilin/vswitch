@@ -1,0 +1,2 @@
+noprofile
+copy target/x86_64-unknown-linux-musl/release/vswitch oss://fleetman/staging/prod/vswitch/vswitch

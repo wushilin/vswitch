@@ -1,0 +1,16 @@
+rpc: "http://baba.wushilin.net:4455"
+api_key: "demo-api-key"
+api_secret: "demo-api-secret"
+switch: "switch-1"
+tap: "tap-client1"
+mac: "02:aa:bb:cc:dd:01"
+use_server_routes: false
+ignore_server_routes:
+  - "192.168.44.0/16"
+# Optional static client address; if omitted, RPC join assigned_ip/cidr is used.
+# ipv4: "10.200.1.197/24"
+
+routes:
+  - to: "172.177.1.72/18"
+    via: "10.200.1.1"
+

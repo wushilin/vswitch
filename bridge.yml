@@ -1,0 +1,13 @@
+rpc: "http://bridge.wushilin.net:4444"
+api_key: "demo-api-key"
+switch: "switch-1"
+tap: "tap-client1"
+mac: "0A:13:72:F3:C4:02"
+# use_server_routes: true
+# Optional static client address; if omitted, RPC join assigned_ip/cidr is used.
+# ipv4: "10.200.1.197/24"
+
+  #routes:
+  #  - to: "172.177.1.72/18"
+  #    via: "10.200.1.1"
+

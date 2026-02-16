@@ -1,0 +1,53 @@
+listener: "0.0.0.0:4456"
+advertised_listener: "baba.wushilin.net:4456"
+rpc: "0.0.0.0:4455"
+principals:
+  - name: "demo-client"
+    api_credentials:
+      - api_key: "demo-api-key"
+        api_secret: "demo-api-secret"
+      - api_key: "demo-api-key-2"
+        api_secret: "demo-api-secret-2"
+    groups:
+      - "trusted"
+groups:
+  - name: "trusted"
+acl:
+  - switch: "switch-1"
+    principals:
+      - "demo-client"
+  - switch: "switch-2"
+    groups:
+      - "trusted"
+rpc_hmac_secret: "change-this-secret"
+crypto_method: "AES-GCM-256"
+
+switches:
+  - name: "switch-1"
+    tap: "tap-server1"
+    disable_unknown_mac: true
+    mac: "02:11:22:33:44:01"
+    ipv4: "10.200.1.1/24"
+    address_reservation:
+      - mac: "02:aa:bb:cc:dd:01"
+        ipv4: "10.220.22.33/24"
+    server_routes:
+      - to: "10.99.0.0/16"
+        via: "10.200.1.5"
+    client_routes:
+      - to: "172.19.0.0/16"
+        via: "10.200.1.1"
+
+  - name: "switch-2"
+    tap: "tap-server2"
+    disable_unknown_mac: true
+    mac: "02:11:22:33:44:02"
+    ipv4: "10.200.2.1/24"
+    server_routes: []
+    client_routes: []
+
+bridges:
+  - name: "bridge-12"
+    members:
+      - "switch-1"
+      - "switch-2"

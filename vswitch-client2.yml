@@ -1,0 +1,5 @@
+rpc: "http://baba.wushilin.net:4455"
+api_key: "demo-api-key"
+switch: "switch-2"
+tap: "tap-client2"
+mac: "02:aa:bb:cc:dd:01"
