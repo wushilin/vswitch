@@ -76,6 +76,38 @@ Bridge group (switch-1 + switch-2):
   unknown unicast: flood across bridge members
 ```
 
+### Client Connectivity View (who talks to whom)
+
+```text
+                              Server host
+                    +------------------------------+
+                    |          vswitch             |
+                    |     (MAC learning switch)    |
+                    |                              |
+                    |   local endpoint: Host TAP   |
+                    |   MAC: 02:11:22:33:44:01     |
+                    +-----+------------------+-----+
+                          |                  |
+                          | TCP + encrypted  | TCP + encrypted
+                          | CTRL_DATA frames | CTRL_DATA frames
+                          |                  |
+                  +-------+------+    +------+-------+
+                  |   Client A   |    |   Client B   |
+                  |  TAP: tap-a  |    |  TAP: tap-b  |
+                  |  10.200.1.10 |    |  10.200.1.11 |
+                  +-------+------+    +------+-------+
+                          \               /
+                           \             /
+                            \-----------/
+                      L2 communication via switch
+
+Examples:
+- Client A -> Client B ping:
+  A sends ARP broadcast -> switch floods -> B replies -> switch forwards unicast.
+- Client A -> Server TAP IP ping:
+  A sends ARP for host TAP IP -> switch forwards to LocalTap -> host replies.
+```
+
 ### RPC wake-up path with eventfd
 
 ```text
