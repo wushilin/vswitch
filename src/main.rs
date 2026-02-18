@@ -16,6 +16,7 @@ use hmac::Mac as _;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, IoSlice, Read, Write};
@@ -53,6 +54,7 @@ const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const RPC_NONCE_TTL_MS: u64 = 5 * 60 * 1000;
 const RPC_MAX_PAST_SKEW_MS: u64 = 2 * 60 * 1000;
 const ADMIN_SESSION_TTL_MS: u64 = 8 * 60 * 60 * 1000;
+const DROP_LOG_INTERVAL_MS: u64 = 5_000;
 
 type Mac = [u8; 6];
 type HmacSha256 = Hmac<Sha256>;
@@ -112,6 +114,7 @@ struct ServerSwitchConfig {
     disable_unknown_mac: bool,
     mac: Option<String>,
     ipv4: Option<String>,
+    client_ip_pool: Option<String>,
     address_reservation: Option<Vec<AddressReservationConfig>>,
     server_routes: Option<Vec<RouteSpec>>,
     client_routes: Option<Vec<RouteSpec>>,
@@ -308,6 +311,25 @@ impl RingBuffer {
         Ok(out)
     }
 
+    fn range_slices(&self, offset: usize, len: usize) -> Result<(&[u8], &[u8])> {
+        if offset.saturating_add(len) > self.len {
+            bail!(
+                "ring buffer range out of bounds: offset={} len={} buffered={}",
+                offset,
+                len,
+                self.len
+            );
+        }
+        let cap = self.buf.len();
+        let begin = (self.start + offset) % cap;
+        let first_len = (cap - begin).min(len);
+        let second_len = len - first_len;
+        Ok((
+            &self.buf[begin..begin + first_len],
+            &self.buf[..second_len],
+        ))
+    }
+
     fn consume(&mut self, n: usize) -> Result<()> {
         if n > self.len {
             bail!("ring buffer consume out of bounds: consume={} buffered={}", n, self.len);
@@ -439,7 +461,16 @@ struct RpcSwitchView {
     server_routes: Vec<RouteSpec>,
     client_routes: Vec<RouteSpec>,
     #[serde(skip_serializing)]
+    client_ip_pool: Option<ClientIpPool>,
+    #[serde(skip_serializing)]
     address_reservations: HashMap<String, ReservedAddress>,
+}
+
+#[derive(Clone)]
+struct ClientIpPool {
+    start: u32,
+    end: u32,
+    cidr: String,
 }
 
 #[derive(Clone)]
@@ -696,6 +727,12 @@ fn run_server_config_mode(path: &str) -> Result<()> {
             host_ip = Some(ip.to_string());
             network_cidr = Some(cidr);
         }
+        let client_ip_pool = sw
+            .client_ip_pool
+            .as_deref()
+            .map(parse_client_ip_pool)
+            .transpose()
+            .with_context(|| format!("invalid client_ip_pool for switch {}", sw.name))?;
         let mut address_reservations: HashMap<String, ReservedAddress> = HashMap::default();
         if let Some(resv) = sw.address_reservation.as_ref() {
             for item in resv {
@@ -796,6 +833,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
                 tap: tap.name.clone(),
                 server_routes: sw.server_routes.clone().unwrap_or_default(),
                 client_routes: normalized_client_routes,
+                client_ip_pool,
                 address_reservations,
             },
         );
@@ -816,6 +854,31 @@ fn run_server_config_mode(path: &str) -> Result<()> {
         for b in bridge_cfgs {
             if b.members.is_empty() {
                 bail!("bridge {} has no members", b.name);
+            }
+            for i in 0..b.members.len() {
+                for j in (i + 1)..b.members.len() {
+                    let left = &b.members[i];
+                    let right = &b.members[j];
+                    let left_pool = switch_views
+                        .get(left)
+                        .and_then(|sw| sw.client_ip_pool.as_ref());
+                    let right_pool = switch_views
+                        .get(right)
+                        .and_then(|sw| sw.client_ip_pool.as_ref());
+                    if let (Some(lp), Some(rp)) = (left_pool, right_pool)
+                        && lp.start <= rp.end
+                        && rp.start <= lp.end
+                    {
+                        bail!(
+                            "bridge {} has overlapping client_ip_pool ranges between switches {} ({}) and {} ({})",
+                            b.name,
+                            left,
+                            format!("{}-{}", Ipv4Addr::from(lp.start), Ipv4Addr::from(lp.end)),
+                            right,
+                            format!("{}-{}", Ipv4Addr::from(rp.start), Ipv4Addr::from(rp.end))
+                        );
+                    }
+                }
             }
             let mut members: Vec<u16> = Vec::with_capacity(b.members.len());
             for member_name in &b.members {
@@ -1383,20 +1446,10 @@ fn process_mux_client_read(
     switch_to_bridge: &HashMap<u16, usize>,
     bridges: &mut [BridgeState],
 ) -> Result<()> {
-    enum ParsedMsg {
-        Register {
-            switch_name: String,
-            token: String,
-            mac: Mac,
-        },
-        Data { frame: Vec<u8> },
-    }
-
-    let mut parsed: Vec<ParsedMsg> = Vec::new();
-    {
-        let client = clients
-            .get_mut(&fd)
-            .ok_or_else(|| anyhow!("mux client disappeared"))?;
+    let mut client = clients
+        .remove(&fd)
+        .ok_or_else(|| anyhow!("mux client disappeared"))?;
+    let res = (|| -> Result<()> {
         let mut tmp = [0u8; 4096];
         loop {
             if client.in_buf.len() >= MAX_IN_BUF_BYTES_PER_CLIENT {
@@ -1457,11 +1510,56 @@ fn process_mux_client_read(
                             .to_string();
                     let mut mac = [0u8; 6];
                     client.in_buf.copy_out(token_end, &mut mac)?;
-                    parsed.push(ParsedMsg::Register {
-                        switch_name,
-                        token,
+
+                    let server_switch_id = match switch_name_to_id.get(&switch_name).copied() {
+                        Some(id) => id,
+                        None => {
+                            let _ =
+                                write_error_msg_best_effort(&mut client.stream, ERR_UNKNOWN_SWITCH);
+                            return Err(anyhow!(
+                                "client fd={fd} tried to register unknown switch={switch_name}, disconnecting"
+                            ));
+                        }
+                    };
+
+                    let grant = match validate_join_token(control, &switch_name, &token, &mac) {
+                        Ok(ip) => ip,
+                        Err(err) => {
+                            let _ =
+                                write_error_msg_best_effort(&mut client.stream, ERR_INVALID_TOKEN);
+                            return Err(anyhow!(
+                                "client fd={fd} token validation failed for switch={switch_name}: {err:#}"
+                            ));
+                        }
+                    };
+
+                    let old = client.binding.replace(ClientBinding {
+                        server_switch_id,
                         mac,
+                        assigned_ipv4: grant.assigned_ipv4.clone(),
+                        crypto: grant.crypto,
                     });
+
+                    if let Some(old_binding) = old
+                        && let Some(sw) = switches.get_mut(&old_binding.server_switch_id)
+                        && matches!(
+                            sw.mac_table.get(&old_binding.mac),
+                            Some(Endpoint::Client(existing_fd)) if *existing_fd == fd
+                        )
+                    {
+                        sw.mac_table.remove(&old_binding.mac);
+                    }
+
+                    if let Some(sw) = switches.get_mut(&server_switch_id) {
+                        sw.mac_table.insert(mac, Endpoint::Client(fd));
+                        info!(
+                            "client fd={fd} registered switch={} mac={}",
+                            sw.name,
+                            format_mac(&mac)
+                        );
+                    }
+                    update_peer_register(control, &switch_name, mac, grant.assigned_ip);
+                    client.out_buf.push_u8(CTRL_ACK)?;
                     consumed += msg_len;
                 }
                 CTRL_DATA => {
@@ -1485,9 +1583,69 @@ fn process_mux_client_read(
                     if client.in_buf.len() < consumed + msg_len {
                         break;
                     }
+
+                    let Some((server_switch_id, crypto_key, registered_mac)) = client
+                        .binding
+                        .as_ref()
+                        .map(|b| (b.server_switch_id, b.crypto.map(|x| x.key), b.mac))
+                    else {
+                        warn!("client fd={fd} sent frame before registration");
+                        consumed += msg_len;
+                        continue;
+                    };
+
                     let frame_start = consumed + 3;
-                    let frame = client.in_buf.copy_vec(frame_start, len)?;
-                    parsed.push(ParsedMsg::Data { frame });
+                    let (f1, f2) = client.in_buf.range_slices(frame_start, len)?;
+                    let encrypted_frame: Cow<[u8]> = if f2.is_empty() {
+                        Cow::Borrowed(f1)
+                    } else {
+                        let mut v = Vec::with_capacity(len);
+                        v.extend_from_slice(f1);
+                        v.extend_from_slice(f2);
+                        Cow::Owned(v)
+                    };
+
+                    let plain: Cow<[u8]> = if let Some(key) = crypto_key {
+                        Cow::Owned(decrypt_payload_aes_gcm(
+                            &key,
+                            NONCE_DIR_CLIENT_TO_SERVER,
+                            &encrypted_frame,
+                        )?)
+                    } else {
+                        encrypted_frame
+                    };
+                    let plain = plain.as_ref();
+
+                    if plain.len() >= 12
+                        && let Some(sw) = switches.get(&server_switch_id)
+                        && sw.disable_unknown_mac
+                    {
+                        let mut src_mac = [0u8; 6];
+                        src_mac.copy_from_slice(&plain[6..12]);
+                        if src_mac != registered_mac {
+                            warn!(
+                                "dropped frame from client fd={} switch={} due to unknown source mac={}, expected registered mac={}",
+                                fd,
+                                sw.name,
+                                format_mac(&src_mac),
+                                format_mac(&registered_mac)
+                            );
+                            consumed += msg_len;
+                            continue;
+                        }
+                    }
+
+                    client.last_from_client_ms = Some(unix_now_ms());
+                    route_frame_mux(
+                        epfd,
+                        server_switch_id,
+                        plain,
+                        Endpoint::Client(fd),
+                        switches,
+                        clients,
+                        switch_to_bridge,
+                        bridges,
+                    )?;
                     consumed += msg_len;
                 }
                 _ => bail!("unknown message type {kind} from client {fd}"),
@@ -1496,145 +1654,11 @@ fn process_mux_client_read(
         if consumed > 0 {
             client.in_buf.consume(consumed)?;
         }
-    }
-
-    for msg in parsed {
-        match msg {
-            ParsedMsg::Register {
-                switch_name,
-                token,
-                mac,
-            } => {
-                let server_switch_id = match switch_name_to_id.get(&switch_name).copied() {
-                    Some(id) => id,
-                    None => {
-                        if let Some(client) = clients.get_mut(&fd) {
-                            let _ = write_error_msg_best_effort(
-                                &mut client.stream,
-                                ERR_UNKNOWN_SWITCH,
-                            );
-                        }
-                        return Err(anyhow!(
-                            "client fd={fd} tried to register unknown switch={switch_name}, disconnecting"
-                        ));
-                    }
-                };
-
-                let grant = match validate_join_token(
-                    control,
-                    &switch_name,
-                    &token,
-                    &mac,
-                ) {
-                    Ok(ip) => ip,
-                    Err(err) => {
-                        if let Some(client) = clients.get_mut(&fd) {
-                            let _ = write_error_msg_best_effort(
-                                &mut client.stream,
-                                ERR_INVALID_TOKEN,
-                            );
-                        }
-                        return Err(anyhow!(
-                            "client fd={fd} token validation failed for switch={switch_name}: {err:#}"
-                        ));
-                    }
-                };
-
-                let old = {
-                    let client = clients
-                        .get_mut(&fd)
-                        .ok_or_else(|| anyhow!("mux client disappeared"))?;
-                    client.binding.replace(ClientBinding {
-                        server_switch_id,
-                        mac,
-                        assigned_ipv4: grant.assigned_ipv4.clone(),
-                        crypto: grant.crypto,
-                    })
-                };
-
-                if let Some(old_binding) = old
-                    && let Some(sw) = switches.get_mut(&old_binding.server_switch_id)
-                    && matches!(
-                        sw.mac_table.get(&old_binding.mac),
-                        Some(Endpoint::Client(existing_fd)) if *existing_fd == fd
-                    )
-                {
-                    sw.mac_table.remove(&old_binding.mac);
-                }
-
-                if let Some(sw) = switches.get_mut(&server_switch_id) {
-                    sw.mac_table.insert(mac, Endpoint::Client(fd));
-                    info!(
-                        "client fd={fd} registered switch={} mac={}",
-                        sw.name,
-                        format_mac(&mac)
-                    );
-                }
-                update_peer_register(control, &switch_name, mac, grant.assigned_ip);
-                if let Some(client) = clients.get_mut(&fd) {
-                    client.out_buf.push_u8(CTRL_ACK)?;
-                    epoll_mod(epfd, fd, mux_client_interest(client))?;
-                }
-            }
-            ParsedMsg::Data { frame } => {
-                let Some((server_switch_id, crypto_key, registered_mac)) = clients
-                    .get(&fd)
-                    .and_then(|c| c.binding.as_ref())
-                    .map(|b| (b.server_switch_id, b.crypto.map(|x| x.key), b.mac))
-                else {
-                    warn!("client fd={fd} sent frame before registration");
-                    continue;
-                };
-
-                let plain = if let Some(key) = crypto_key {
-                    decrypt_payload_aes_gcm(
-                        &key,
-                        NONCE_DIR_CLIENT_TO_SERVER,
-                        &frame,
-                    )?
-                } else {
-                    frame
-                };
-                if plain.len() >= 12
-                    && let Some(sw) = switches.get(&server_switch_id)
-                    && sw.disable_unknown_mac
-                {
-                    let mut src_mac = [0u8; 6];
-                    src_mac.copy_from_slice(&plain[6..12]);
-                    if src_mac != registered_mac {
-                        warn!(
-                            "dropped frame from client fd={} switch={} due to unknown source mac={}, expected registered mac={}",
-                            fd,
-                            sw.name,
-                            format_mac(&src_mac),
-                            format_mac(&registered_mac)
-                        );
-                        continue;
-                    }
-                }
-
-                if let Some(client) = clients.get_mut(&fd) {
-                    client.last_from_client_ms = Some(unix_now_ms());
-                }
-
-                route_frame_mux(
-                    epfd,
-                    server_switch_id,
-                    &plain,
-                    Endpoint::Client(fd),
-                    switches,
-                    clients,
-                    switch_to_bridge,
-                    bridges,
-                )?;
-            }
-        }
-    }
-
-    if let Some(client) = clients.get_mut(&fd) {
-        epoll_mod(epfd, fd, mux_client_interest(client))?;
-    }
-    Ok(())
+        epoll_mod(epfd, fd, mux_client_interest(&client))?;
+        Ok(())
+    })();
+    clients.insert(fd, client);
+    res
 }
 
 fn route_frame_mux(
@@ -1808,13 +1832,16 @@ fn enqueue_frame_mux(
     let len = u16::try_from(payload.len()).map_err(|_| anyhow!("frame too large to enqueue"))?;
     let msg_size = 1usize + 2usize + payload.len();
     if client.out_buf.len().saturating_add(msg_size) > MAX_OUT_BUF_BYTES_PER_CLIENT {
-        warn!(
-            "dropped frame enqueue for client fd={} switch_id={} due to output queue full current_bytes={} cap={}",
-            fd,
-            server_switch_id,
-            client.out_buf.len(),
-            MAX_OUT_BUF_BYTES_PER_CLIENT
-        );
+        let now_ms = unix_now_ms();
+        if should_emit_drop_log(now_ms) {
+            warn!(
+                "dropped frame enqueue for client fd={} switch_id={} due to output queue full current_bytes={} cap={}",
+                fd,
+                server_switch_id,
+                client.out_buf.len(),
+                MAX_OUT_BUF_BYTES_PER_CLIENT
+            );
+        }
         return Ok(());
     }
     client.out_buf.push_u8(CTRL_DATA)?;
@@ -3503,13 +3530,32 @@ fn assign_ip_for_switch(
     req_mac: &Mac,
     requested_ip: Option<Ipv4Addr>,
 ) -> Option<(Ipv4Addr, String)> {
-    let cidr = sw.cidr.clone()?;
-    let (network, prefix) = parse_cidr(&cidr).ok()?;
-    let mask = prefix_to_mask(prefix);
-    let network_u = u32::from(network) & mask;
-    let broadcast_u = network_u | !mask;
-    let first = network_u + 1;
-    let last = broadcast_u.saturating_sub(1);
+    let (cidr, first, last, network_u, broadcast_u) = if let Some(pool) = sw.client_ip_pool.as_ref() {
+        let (network, prefix) = parse_cidr(&pool.cidr).ok()?;
+        let mask = prefix_to_mask(prefix);
+        let network_u = u32::from(network) & mask;
+        let broadcast_u = network_u | !mask;
+        (
+            pool.cidr.clone(),
+            pool.start,
+            pool.end,
+            network_u,
+            broadcast_u,
+        )
+    } else {
+        let cidr = sw.cidr.clone()?;
+        let (network, prefix) = parse_cidr(&cidr).ok()?;
+        let mask = prefix_to_mask(prefix);
+        let network_u = u32::from(network) & mask;
+        let broadcast_u = network_u | !mask;
+        (
+            cidr,
+            network_u + 1,
+            broadcast_u.saturating_sub(1),
+            network_u,
+            broadcast_u,
+        )
+    };
     let host_ip = sw
         .host_ip
         .as_deref()
@@ -3598,6 +3644,9 @@ fn assign_ip_for_switch(
         if req_u == network_u || req_u == broadcast_u {
             return None;
         }
+        if req_u < first || req_u > last {
+            return None;
+        }
         if Some(req_u) == host_ip {
             return None;
         }
@@ -3639,6 +3688,25 @@ fn unix_now_ms() -> u64 {
 }
 
 static NEXT_JTI: AtomicU64 = AtomicU64::new(1);
+static LAST_DROP_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn should_emit_drop_log(now_ms: u64) -> bool {
+    let mut last = LAST_DROP_LOG_MS.load(AtomicOrdering::Relaxed);
+    loop {
+        if now_ms.saturating_sub(last) < DROP_LOG_INTERVAL_MS {
+            return false;
+        }
+        match LAST_DROP_LOG_MS.compare_exchange_weak(
+            last,
+            now_ms,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => last = observed,
+        }
+    }
+}
 
 fn fetch_join_from_rpc(
     rpc_base: &str,
@@ -4199,6 +4267,52 @@ fn parse_ipv4_with_prefix(addr: &str) -> Result<(Ipv4Addr, u8)> {
         bail!("ipv4 prefix must be <= 32: {prefix}");
     }
     Ok((ip, prefix))
+}
+
+fn parse_client_ip_pool(spec: &str) -> Result<ClientIpPool> {
+    let (range, prefix_s) = spec
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid client_ip_pool format: {spec}"))?;
+    let (start_s, end_s) = range
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid client_ip_pool range format: {range}"))?;
+    let start_ip = start_s
+        .trim()
+        .parse::<Ipv4Addr>()
+        .with_context(|| format!("invalid client_ip_pool start IP: {start_s}"))?;
+    let end_ip = end_s
+        .trim()
+        .parse::<Ipv4Addr>()
+        .with_context(|| format!("invalid client_ip_pool end IP: {end_s}"))?;
+    let prefix = prefix_s
+        .trim()
+        .parse::<u8>()
+        .with_context(|| format!("invalid client_ip_pool prefix: {prefix_s}"))?;
+    if prefix > 32 {
+        bail!("client_ip_pool prefix must be <= 32: {prefix}");
+    }
+
+    let start_u = u32::from(start_ip);
+    let end_u = u32::from(end_ip);
+    if start_u > end_u {
+        bail!("client_ip_pool start must be <= end: {spec}");
+    }
+
+    let mask = prefix_to_mask(prefix);
+    let network_u = start_u & mask;
+    let broadcast_u = network_u | !mask;
+    if (end_u & mask) != network_u {
+        bail!("client_ip_pool range must be inside one /{prefix} network: {spec}");
+    }
+    if start_u == network_u || end_u == broadcast_u {
+        bail!("client_ip_pool range must not include network/broadcast address: {spec}");
+    }
+
+    Ok(ClientIpPool {
+        start: start_u,
+        end: end_u,
+        cidr: format!("{}/{}", Ipv4Addr::from(network_u), prefix),
+    })
 }
 
 fn iface_has_ipv6(if_name: &str) -> Result<bool> {

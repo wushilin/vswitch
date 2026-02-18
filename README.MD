@@ -284,6 +284,7 @@ switches:
     disable_unknown_mac: true
     mac: "02:11:22:33:44:01"
     ipv4: "10.200.1.1/24"
+    client_ip_pool: "10.200.3.2-10.200.77.175/16"
     address_reservation:
       - mac: "02:aa:bb:cc:dd:01"
         ipv4: "10.220.22.33/24"
@@ -311,6 +312,9 @@ The `admin` group is implicit (built-in), so it is valid even if omitted from `g
 Only principals in an allowed admin group can access `/vswitch/admin/*`.
 Principals in built-in `admin` group can join any switch regardless of ACL rules.
 Duplicate API keys or web-login usernames across principals cause startup failure.
+`client_ip_pool` is optional and controls dynamic client IP allocation range for that switch.
+Format: `<start-ip>-<end-ip>/<prefix>` (for example `10.200.3.2-10.200.77.175/16`).
+If omitted, allocation uses the switch `ipv4` CIDR host range.
 
 ### Client (`vswitch-client.yml`)
 

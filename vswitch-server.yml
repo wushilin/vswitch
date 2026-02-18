@@ -38,6 +38,7 @@ switches:
     disable_unknown_mac: true
     mac: "02:11:22:33:44:01"
     ipv4: "10.200.1.1/24"
+    client_ip_pool: "10.200.3.2-10.200.77.175/16"
     address_reservation:
       - mac: "02:aa:bb:cc:dd:01"
         ipv4: "10.220.22.33/24"
