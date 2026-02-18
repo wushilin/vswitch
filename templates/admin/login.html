@@ -1,0 +1,18 @@
+<div class="login-wrap">
+  <div class="card">
+    <h1 class="title">Sign in</h1>
+    <p class="muted">Use an admin web login username and password.</p>
+    {{error_html}}
+    <form method="post" action="/vswitch/admin/login">
+      <div class="mb10">
+        <label class="muted">Username</label><br/>
+        <input class="input w100" name="username" type="text" required>
+      </div>
+      <div class="mb14">
+        <label class="muted">Password</label><br/>
+        <input class="input w100" name="password" type="password" required>
+      </div>
+      <button class="btn" type="submit">Login</button>
+    </form>
+  </div>
+</div>

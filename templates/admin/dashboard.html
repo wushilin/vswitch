@@ -1,0 +1,24 @@
+<div class="card">
+  <h1 class="title">Dashboard</h1>
+  <p class="muted">Generated at {{generated_at_ms}} ms</p>
+  <div class="kpis">
+    <div class="kpi"><div class="v">{{switches_count}}</div><div class="l">Switches</div></div>
+    <div class="kpi"><div class="v">{{clients_count}}</div><div class="l">Connected clients</div></div>
+    <div class="kpi"><div class="v">{{reservations_count}}</div><div class="l">Reservations</div></div>
+    <div class="kpi"><div class="v">{{bridges_count}}</div><div class="l">Bridges</div></div>
+  </div>
+</div>
+<div class="card">
+  <h2>Bridge Topology</h2>
+  {{bridge_tree_html}}
+</div>
+<div class="card">
+  <h2>Switches</h2>
+  <div class="toolbar"><input class="input" placeholder="Filter switches..." data-filter="tbl-switches"></div>
+  <table id="tbl-switches">
+    <thead>
+      <tr><th data-sort>Name</th><th data-sort>Bridge</th><th data-sort>TAP</th><th data-sort>CIDR</th><th data-sort>Host IP</th><th data-sort>Clients</th></tr>
+    </thead>
+    <tbody>{{switch_rows}}</tbody>
+  </table>
+</div>

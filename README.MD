@@ -21,9 +21,13 @@ It combines:
 - Host TAP integration per switch (server-side TAP acts as local endpoint)
 - Client TAP endpoint with auto rejoin loop
 - Join token flow with short-lived one-time JWT
-- API key + HMAC request authentication for RPC
+- API key + HMAC request authentication for RPC clients
 - Per-client crypto session key distribution (`AES-GCM-256`)
 - Source MAC anti-spoof enforcement (`disable_unknown_mac`, default true)
+- Admin web console on RPC port with form login (username + bcrypt password + admin group)
+- Split principal credentials:
+  - `credentials.api_keys` for RPC clients only
+  - `credentials.web_logins` for admin web login only
 - Route provisioning:
   - server routes on server TAP (`server_routes`)
   - server-proposed routes for clients (`client_routes`)
@@ -249,13 +253,24 @@ advertised_listener: "example.com:4456"
 rpc: "0.0.0.0:4455"
 principals:
   - name: "demo-client"
-    api_credentials:
-      - api_key: "demo-api-key"
-        api_secret: "demo-api-secret"
+    credentials:
+      api_keys:
+        - "demo-api-key:demo-api-secret"
+      web_logins: []
     groups:
       - "trusted"
+  - name: "demo-admin"
+    credentials:
+      api_keys: []
+      web_logins:
+        - "admin:REPLACE_WITH_BCRYPT_HASH"
+    groups:
+      - "admin"
 groups:
   - name: "trusted"
+  - name: "admin"
+admin_groups:
+  - "admin"
 acl:
   - switch: "switch-1"
     groups:
@@ -291,6 +306,12 @@ bridges:
       - "switch-2"
 ```
 
+If `admin_groups` is omitted or empty, it defaults to `["admin"]`.
+The `admin` group is implicit (built-in), so it is valid even if omitted from `groups:`.
+Only principals in an allowed admin group can access `/vswitch/admin/*`.
+Principals in built-in `admin` group can join any switch regardless of ACL rules.
+Duplicate API keys or web-login usernames across principals cause startup failure.
+
 ### Client (`vswitch-client.yml`)
 
 ```yaml
@@ -316,11 +337,30 @@ routes:
 ## Running
 
 ```bash
+# Global help
+vswitch --help
+
 # Server
 vswitch server -c vswitch-server.yml
 
 # Client
 vswitch client -c vswitch-client.yml
+
+# Generate web login credential (username:bcrypt-hash)
+vswitch password
+
+# Non-interactive examples
+vswitch password --username wushilin --password "your-password"
+printf 'your-password\n' | vswitch password --username wushilin --password-stdin
+```
+
+Password helper output format:
+
+```text
+Enter your username: wushilin
+Enter your password: ******
+Your password:
+wushilin:$2b$12$...
 ```
 
 If `-c/--config` is omitted, auto-load order:
@@ -334,10 +374,28 @@ If `-c/--config` is omitted, auto-load order:
 - `GET /vswitch/switches/list`
 - `GET /vswitch/switches/{name}/join`
 - `GET /vswitch/switches/{name}/peers`
+- `GET /vswitch/admin/login` (form login page)
+- `POST /vswitch/admin/login` (username/password form submit; bcrypt verify)
+- `GET /vswitch/admin/logout`
+- `GET /vswitch/admin` (switch list + links)
+- `GET /vswitch/admin/switches/{name}` (clients/mac/source/assigned/last tx+rx)
+- `GET /vswitch/admin/reservations`
+- `GET /vswitch/admin/server-routes`
+- `GET /vswitch/admin/client-routes`
+- `GET /vswitch/admin/bridges`
+- `GET /vswitch/admin/networks`
 
 ---
 
 ## Operational Notes
+
+- **Auth & ACL Rules**
+  - `credentials.api_keys` are for RPC/HMAC clients only.
+  - `credentials.web_logins` are for `/vswitch/admin/*` form login only (username + bcrypt hash).
+  - Principals in built-in `admin` group can join any switch (ACL bypass) and can access admin UI if `admin_groups` allows `admin` (default behavior).
+  - API keys and API secrets are case-sensitive; web-login usernames are matched case-insensitively.
+  - Principal and group names are normalized to lowercase internally.
+  - Duplicate API keys or duplicate web-login usernames across principals cause startup failure.
 
 - Keep `rpc_hmac_secret` and principal `api_secret` values strong and private.
 - Prefer private RPC exposure and/or TLS termination in production.

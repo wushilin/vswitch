@@ -1,0 +1,45 @@
+<div class="card">
+  <h1 class="title">Switch: {{switch_name}}</h1>
+  <div class="grid-2">
+    <div><span class="muted">tap</span><br><b>{{tap}}</b></div>
+    <div><span class="muted">host mac</span><br><b>{{host_mac}}</b></div>
+    <div><span class="muted">host ip</span><br><b>{{host_ip}}</b></div>
+    <div><span class="muted">cidr</span><br><b>{{cidr}}</b></div>
+  </div>
+</div>
+<div class="card">
+  <h2>Connected clients</h2>
+  <div class="toolbar"><input class="input" placeholder="Filter clients..." data-filter="tbl-clients"></div>
+  <table id="tbl-clients">
+    <thead>
+      <tr>
+        <th data-sort>MAC</th><th data-sort>Source IP:Port</th><th data-sort>Assigned IP</th><th data-sort>Assigned network</th>
+        <th data-sort>Last packet sent (from client)</th><th data-sort>Last packet received (by client)</th>
+      </tr>
+    </thead>
+    <tbody>{{client_rows}}</tbody>
+  </table>
+</div>
+<div class="grid-2">
+  <div class="card">
+    <h2>Server Routes</h2>
+    <table>
+      <thead><tr><th>To</th><th>Via</th></tr></thead>
+      <tbody>{{server_route_rows}}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Client Routes</h2>
+    <table>
+      <thead><tr><th>To</th><th>Via</th></tr></thead>
+      <tbody>{{client_route_rows}}</tbody>
+    </table>
+  </div>
+</div>
+<div class="card">
+  <h2>Address Reservations</h2>
+  <table>
+    <thead><tr><th>MAC</th><th>Reserved IPv4</th></tr></thead>
+    <tbody>{{reservation_rows}}</tbody>
+  </table>
+</div>

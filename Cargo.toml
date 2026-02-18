@@ -17,3 +17,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
+bcrypt = "0.18.0"
+rpassword = "7.4.0"
+clap = { version = "4.5.59", features = ["derive"] }
+ahash = "0.8.12"
+fxhash = "0.2.1"

@@ -3,15 +3,25 @@ advertised_listener: "baba.wushilin.net:4456"
 rpc: "0.0.0.0:4455"
 principals:
   - name: "demo-client"
-    api_credentials:
-      - api_key: "demo-api-key"
-        api_secret: "demo-api-secret"
-      - api_key: "demo-api-key-2"
-        api_secret: "demo-api-secret-2"
+    credentials:
+      api_keys:
+        - "demo-api-key:demo-api-secret"
+        - "demo-api-key-2:demo-api-secret-2"
+      web_logins: []
     groups:
       - "trusted"
+  - name: "demo-admin"
+    credentials:
+      api_keys: []
+      web_logins:
+        - "admin:REPLACE_WITH_BCRYPT_HASH"
+    groups:
+      - "admin"
 groups:
   - name: "trusted"
+  - name: "admin"
+admin_groups:
+  - "admin"
 acl:
   - switch: "switch-1"
     principals:

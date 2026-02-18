@@ -1,19 +1,24 @@
 use anyhow::{Context, Result, anyhow, bail};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, Uri};
+use axum::extract::{Form, Path as AxumPath, Query, State};
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Request, Uri};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use bcrypt::{DEFAULT_COST, hash as hash_bcrypt, verify as verify_bcrypt};
+use clap::{Parser, Subcommand};
+use fxhash::FxHashMap as HashMap;
 use hmac::Hmac;
 use hmac::Mac as _;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
-use std::env;
+use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
@@ -47,6 +52,7 @@ const IFF_NO_PI: libc::c_short = 0x1000;
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const RPC_NONCE_TTL_MS: u64 = 5 * 60 * 1000;
 const RPC_MAX_PAST_SKEW_MS: u64 = 2 * 60 * 1000;
+const ADMIN_SESSION_TTL_MS: u64 = 8 * 60 * 60 * 1000;
 
 type Mac = [u8; 6];
 type HmacSha256 = Hmac<Sha256>;
@@ -91,6 +97,7 @@ struct ServerConfig {
     principals: Option<Vec<PrincipalConfig>>,
     groups: Option<Vec<GroupConfig>>,
     acl: Option<Vec<JoinAclConfig>>,
+    admin_groups: Option<Vec<String>>,
     rpc_hmac_secret: Option<String>,
     crypto_method: Option<String>,
     switches: Vec<ServerSwitchConfig>,
@@ -125,14 +132,16 @@ struct BridgeConfig {
 #[derive(Deserialize)]
 struct PrincipalConfig {
     name: String,
-    api_credentials: Vec<ApiCredentialConfig>,
+    credentials: PrincipalCredentialConfig,
     groups: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-struct ApiCredentialConfig {
-    api_key: String,
-    api_secret: String,
+#[derive(Deserialize, Default)]
+struct PrincipalCredentialConfig {
+    #[serde(default)]
+    api_keys: Vec<String>,
+    #[serde(default)]
+    web_logins: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +187,7 @@ struct BridgeEndpoint {
 }
 
 struct BridgeState {
+    name: String,
     members: Vec<u16>,
     mac_table: HashMap<Mac, BridgeEndpoint>,
 }
@@ -186,6 +196,7 @@ struct BridgeState {
 struct ClientBinding {
     server_switch_id: u16,
     mac: Mac,
+    assigned_ipv4: Option<String>,
     crypto: Option<BindingCrypto>,
 }
 
@@ -207,9 +218,143 @@ struct RouteSpec {
 
 struct ClientMuxState {
     stream: TcpStream,
-    in_buf: Vec<u8>,
-    out_buf: Vec<u8>,
+    in_buf: RingBuffer,
+    out_buf: RingBuffer,
     binding: Option<ClientBinding>,
+    peer_addr: Option<String>,
+    last_from_client_ms: Option<u64>,
+    last_to_client_ms: Option<u64>,
+}
+
+struct RingBuffer {
+    buf: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl RingBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: vec![0u8; capacity],
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.len)
+    }
+
+    fn push_u8(&mut self, value: u8) -> Result<()> {
+        self.push_slice(&[value])
+    }
+
+    fn push_slice(&mut self, src: &[u8]) -> Result<()> {
+        if src.len() > self.remaining() {
+            bail!(
+                "ring buffer overflow: src={} remaining={}",
+                src.len(),
+                self.remaining()
+            );
+        }
+        let cap = self.buf.len();
+        let write_pos = (self.start + self.len) % cap;
+        let first = (cap - write_pos).min(src.len());
+        self.buf[write_pos..write_pos + first].copy_from_slice(&src[..first]);
+        let second = src.len() - first;
+        if second > 0 {
+            self.buf[..second].copy_from_slice(&src[first..]);
+        }
+        self.len += src.len();
+        Ok(())
+    }
+
+    fn peek_u8(&self, offset: usize) -> Option<u8> {
+        if offset >= self.len {
+            return None;
+        }
+        let idx = (self.start + offset) % self.buf.len();
+        Some(self.buf[idx])
+    }
+
+    fn copy_out(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        if offset.saturating_add(out.len()) > self.len {
+            bail!(
+                "ring buffer copy out of bounds: offset={} len={} buffered={}",
+                offset,
+                out.len(),
+                self.len
+            );
+        }
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = self
+                .peek_u8(offset + i)
+                .ok_or_else(|| anyhow!("ring buffer read out of bounds"))?;
+        }
+        Ok(())
+    }
+
+    fn copy_vec(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        self.copy_out(offset, &mut out)?;
+        Ok(out)
+    }
+
+    fn consume(&mut self, n: usize) -> Result<()> {
+        if n > self.len {
+            bail!("ring buffer consume out of bounds: consume={} buffered={}", n, self.len);
+        }
+        self.start = (self.start + n) % self.buf.len();
+        self.len -= n;
+        Ok(())
+    }
+
+    fn head_slices(&self) -> (&[u8], &[u8]) {
+        if self.len == 0 {
+            return (&[], &[]);
+        }
+        let cap = self.buf.len();
+        let first_len = (cap - self.start).min(self.len);
+        let second_len = self.len - first_len;
+        (
+            &self.buf[self.start..self.start + first_len],
+            &self.buf[..second_len],
+        )
+    }
+
+    #[allow(dead_code)]
+    fn resize(&mut self, new_capacity: usize) -> Result<()> {
+        if new_capacity == 0 {
+            bail!("ring buffer resize capacity must be > 0");
+        }
+        let old_capacity = self.buf.len();
+        if new_capacity == old_capacity {
+            return Ok(());
+        }
+        if new_capacity < self.len {
+            bail!(
+                "ring buffer resize too small: new_capacity={} buffered={}",
+                new_capacity,
+                self.len
+            );
+        }
+
+        let mut new_buf = vec![0u8; new_capacity];
+        if self.len > 0 {
+            self.copy_out(0, &mut new_buf[..self.len])?;
+        }
+        self.buf = new_buf;
+        self.start = 0;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -218,20 +363,35 @@ struct RpcState {
     event_fd: RawFd,
     authz: Option<RpcAuthzState>,
     seen_nonces: Arc<Mutex<HashMap<String, u64>>>,
+    admin_sessions: Arc<Mutex<HashMap<String, AdminSession>>>,
 }
 
 #[derive(Clone)]
 struct RpcAuthzState {
-    credentials: HashMap<String, AuthCredential>,
+    api_credentials: HashMap<String, ApiAuthCredential>,
+    web_logins: HashMap<String, WebLoginCredential>,
     principal_groups: HashMap<String, HashSet<String>>,
     switch_acl: HashMap<String, SwitchJoinAcl>,
+    admin_groups: HashSet<String>,
     has_acl_rules: bool,
 }
 
 #[derive(Clone)]
-struct AuthCredential {
+struct AdminSession {
+    principal: String,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone)]
+struct ApiAuthCredential {
     principal: String,
     api_secret: String,
+}
+
+#[derive(Clone)]
+struct WebLoginCredential {
+    principal: String,
+    password_hash: String,
 }
 
 #[derive(Clone)]
@@ -264,6 +424,9 @@ enum ControlPlaneCmd {
         switch_name: String,
         resp: tokio::sync::oneshot::Sender<std::result::Result<Vec<RpcPeer>, u16>>,
     },
+    AdminSnapshot {
+        resp: tokio::sync::oneshot::Sender<AdminSnapshot>,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -273,6 +436,7 @@ struct RpcSwitchView {
     cidr: Option<String>,
     host_mac: String,
     tap: String,
+    server_routes: Vec<RouteSpec>,
     client_routes: Vec<RouteSpec>,
     #[serde(skip_serializing)]
     address_reservations: HashMap<String, ReservedAddress>,
@@ -320,7 +484,91 @@ struct JoinQuery {
 
 struct JoinGrantInfo {
     assigned_ip: Option<Ipv4Addr>,
+    assigned_ipv4: Option<String>,
     crypto: Option<BindingCrypto>,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminSnapshot {
+    generated_at_ms: u64,
+    switches: Vec<AdminSwitchSnapshot>,
+    bridges: Vec<AdminBridgeSnapshot>,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminSwitchSnapshot {
+    name: String,
+    tap: String,
+    host_ip: Option<String>,
+    cidr: Option<String>,
+    host_mac: String,
+    server_routes: Vec<RouteSpec>,
+    client_routes: Vec<RouteSpec>,
+    address_reservations: Vec<AdminReservationSnapshot>,
+    clients: Vec<AdminClientSnapshot>,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminReservationSnapshot {
+    mac: String,
+    ipv4: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminClientSnapshot {
+    mac: String,
+    source_addr: Option<String>,
+    assigned_ip: Option<String>,
+    assigned_network: Option<String>,
+    last_packet_from_client_ms: Option<u64>,
+    last_packet_to_client_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminBridgeSnapshot {
+    name: String,
+    members: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AdminLoginForm {
+    username: String,
+    password: String,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "vswitch", version, about = "Virtual switch dataplane and control-plane daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run server dataplane and RPC API.
+    Server {
+        /// Server config path (auto-detected when omitted).
+        #[arg(short = 'c', long = "config")]
+        config: Option<String>,
+    },
+    /// Run client TAP session.
+    Client {
+        /// Client config path (auto-detected when omitted).
+        #[arg(short = 'c', long = "config")]
+        config: Option<String>,
+    },
+    /// Generate username:bcrypt-hash entry for web_logins.
+    Password {
+        /// Username for the generated web_login entry. Prompts when omitted.
+        #[arg(long = "username")]
+        username: Option<String>,
+        /// Password literal (not recommended; visible in shell history/process list).
+        #[arg(long = "password", conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read password from stdin (single line, trims trailing newline).
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -333,40 +581,71 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        print_usage();
-        bail!("missing mode");
-    }
-
-    match args[1].as_str() {
-        "client" => run_client_mode(&args[2..]),
-        "server" => run_server_mode(&args[2..]),
-        _ => {
-            print_usage();
-            bail!("unknown mode: {}", args[1]);
-        }
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Client { config } => run_client_mode(config),
+        Commands::Server { config } => run_server_mode(config),
+        Commands::Password {
+            username,
+            password,
+            password_stdin,
+        } => run_password_mode(username, password, password_stdin),
     }
 }
 
-fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  vswitch server [-c|--config <server.yml>]");
-    eprintln!("  vswitch client [-c|--config <client.yml>]");
-    eprintln!();
-    eprintln!("Config is mandatory. If -c/--config is omitted, auto-load order is:");
-    eprintln!("  server: ./vswitch-server.yml, ./server.yml, ./vswitch.yml");
-    eprintln!("  client: ./vswitch-client.yml, ./client.yml, ./vswitch.yml");
-}
-
-fn run_client_mode(args: &[String]) -> Result<()> {
-    let path = resolve_config_path("client", args)?;
+fn run_client_mode(config: Option<String>) -> Result<()> {
+    let path = resolve_config_path("client", config)?;
     run_client_config_mode(&path)
 }
 
-fn run_server_mode(args: &[String]) -> Result<()> {
-    let path = resolve_config_path("server", args)?;
+fn run_server_mode(config: Option<String>) -> Result<()> {
+    let path = resolve_config_path("server", config)?;
     run_server_config_mode(&path)
+}
+
+fn prompt_line(label: &str) -> Result<String> {
+    print!("{label}");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .context("failed to read input")?;
+    Ok(value.trim().to_string())
+}
+
+fn run_password_mode(
+    username_arg: Option<String>,
+    password_arg: Option<String>,
+    password_stdin: bool,
+) -> Result<()> {
+    let username = username_arg
+        .unwrap_or(prompt_line("Enter your username: ")?)
+        .trim()
+        .to_string();
+    if username.is_empty() {
+        bail!("username must not be empty");
+    }
+
+    let password = if let Some(pw) = password_arg {
+        pw
+    } else if password_stdin {
+        let mut pw = String::new();
+        io::stdin()
+            .read_line(&mut pw)
+            .context("failed to read password from stdin")?;
+        pw.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        print!("Enter your password: ");
+        io::stdout().flush().context("failed to flush stdout")?;
+        rpassword::read_password().context("failed to read password")?
+    };
+    if password.is_empty() {
+        bail!("password must not be empty");
+    }
+    let hashed = hash_bcrypt(password, DEFAULT_COST).context("failed to hash password")?;
+    println!("Your password:");
+    println!("{username}:{hashed}");
+    Ok(())
 }
 
 fn run_server_config_mode(path: &str) -> Result<()> {
@@ -387,11 +666,11 @@ fn run_server_config_mode(path: &str) -> Result<()> {
     let epfd = epoll_create()?;
     epoll_add(epfd, listener.as_raw_fd(), libc::EPOLLIN as u32)?;
 
-    let mut switches: HashMap<u16, ServerSwitchState> = HashMap::new();
-    let mut switch_name_to_id: HashMap<String, u16> = HashMap::new();
-    let mut tap_fd_to_switch: HashMap<RawFd, u16> = HashMap::new();
-    let mut switch_views: HashMap<String, RpcSwitchView> = HashMap::new();
-    let mut switch_to_bridge: HashMap<u16, usize> = HashMap::new();
+    let mut switches: HashMap<u16, ServerSwitchState> = HashMap::default();
+    let mut switch_name_to_id: HashMap<String, u16> = HashMap::default();
+    let mut tap_fd_to_switch: HashMap<RawFd, u16> = HashMap::default();
+    let mut switch_views: HashMap<String, RpcSwitchView> = HashMap::default();
+    let mut switch_to_bridge: HashMap<u16, usize> = HashMap::default();
     let mut bridges: Vec<BridgeState> = Vec::new();
 
     for (idx, sw) in cfg.switches.iter().enumerate() {
@@ -417,7 +696,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
             host_ip = Some(ip.to_string());
             network_cidr = Some(cidr);
         }
-        let mut address_reservations: HashMap<String, ReservedAddress> = HashMap::new();
+        let mut address_reservations: HashMap<String, ReservedAddress> = HashMap::default();
         if let Some(resv) = sw.address_reservation.as_ref() {
             for item in resv {
                 let mac = parse_mac(&item.mac).with_context(|| {
@@ -500,7 +779,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
         tap_fd_to_switch.insert(tap.file.as_raw_fd(), switch_id);
         switch_name_to_id.insert(sw.name.clone(), switch_id);
 
-        let mut mac_table = HashMap::new();
+        let mut mac_table = HashMap::default();
         mac_table.insert(tap_mac, Endpoint::LocalTap);
         let normalized_client_routes = normalize_routes(
             sw.client_routes.clone().unwrap_or_default(),
@@ -515,6 +794,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
                 cidr: network_cidr,
                 host_mac: format_mac(&tap_mac),
                 tap: tap.name.clone(),
+                server_routes: sw.server_routes.clone().unwrap_or_default(),
                 client_routes: normalized_client_routes,
                 address_reservations,
             },
@@ -560,16 +840,17 @@ fn run_server_config_mode(path: &str) -> Result<()> {
             }
             info!("configured bridge name={} members={}", b.name, b.members.join(","));
             bridges.push(BridgeState {
+                name: b.name.clone(),
                 members,
-                mac_table: HashMap::new(),
+                mac_table: HashMap::default(),
             });
         }
     }
 
     let mut control = ControlPlaneState {
         switches: switch_views,
-        grants: HashMap::new(),
-        peers: HashMap::new(),
+        grants: HashMap::default(),
+        peers: HashMap::default(),
         jwt_secret: cfg.rpc_hmac_secret.clone(),
         advertised_listener: cfg.advertised_listener.clone(),
         crypto_method: cfg
@@ -592,7 +873,8 @@ fn run_server_config_mode(path: &str) -> Result<()> {
             cmd_tx,
             event_fd,
             authz,
-            seen_nonces: Arc::new(Mutex::new(HashMap::new())),
+            seen_nonces: Arc::new(Mutex::new(HashMap::default())),
+            admin_sessions: Arc::new(Mutex::new(HashMap::default())),
         };
         thread::spawn(move || {
             if let Err(err) = run_rpc_server(rpc_bind, rpc_state) {
@@ -601,7 +883,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
         });
     }
 
-    let mut clients: HashMap<RawFd, ClientMuxState> = HashMap::new();
+    let mut clients: HashMap<RawFd, ClientMuxState> = HashMap::default();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
     let mut tap_buf = [0u8; ETH_MAX_FRAME];
 
@@ -613,7 +895,7 @@ fn run_server_config_mode(path: &str) -> Result<()> {
 
             if fd == event_fd {
                 drain_eventfd(event_fd)?;
-                process_control_plane_cmds(&mut control, &cmd_rx)?;
+                process_control_plane_cmds(&mut control, &cmd_rx, &switches, &clients, &bridges)?;
                 continue;
             }
 
@@ -774,12 +1056,14 @@ fn run_client_config_session(cfg: &ClientConfig, sw: &ClientSwitchConfigTop) -> 
         .context("failed to set TCP_NODELAY")?;
     configure_tcp_keepalive(&tx_stream, 15, 5, 3)?;
     let mut rx_stream = tx_stream.try_clone().context("failed to clone stream")?;
+    let client_ip: Ipv4Addr;
     if let Some(ip_cfg) = cfg.ipv4.as_ref() {
         let (ip, prefix) = parse_ipv4_with_prefix(ip_cfg)
             .with_context(|| format!("invalid client ipv4: {ip_cfg}"))?;
         let network = Ipv4Addr::from(u32::from(ip) & prefix_to_mask(prefix));
         let cidr = format!("{network}/{prefix}");
         configure_iface_ipv4(&tap.name, ip, prefix)?;
+        client_ip = ip;
         info!(
             "configured client switch={} TAP={} ip={} network={} (static config)",
             sw.switch, tap.name, ip, cidr
@@ -790,6 +1074,7 @@ fn run_client_config_session(cfg: &ClientConfig, sw: &ClientSwitchConfigTop) -> 
         let network = Ipv4Addr::from(u32::from(ip) & prefix_to_mask(prefix));
         let cidr = format!("{network}/{prefix}");
         configure_iface_ipv4(&tap.name, ip, prefix)?;
+        client_ip = ip;
         info!(
             "configured client switch={} TAP={} ip={} network={} (from rpc join)",
             sw.switch, tap.name, ip, cidr
@@ -801,6 +1086,14 @@ fn run_client_config_session(cfg: &ClientConfig, sw: &ClientSwitchConfigTop) -> 
         .context("invalid routes from server")?;
     if cfg.use_server_routes {
         for route in &normalized_server_routes {
+            if route_via_is_self(route, client_ip)? {
+                warn!(
+                    "Ignoring route to {} from server because via={} equals local client IP",
+                    route.to,
+                    route.via.as_deref().unwrap_or("")
+                );
+                continue;
+            }
             if is_server_route_ignored(route, &ignored_route_ranges)? {
                 info!(
                     "Ignoring route to {} via {} from server due to ignore_server_routes",
@@ -1063,9 +1356,12 @@ fn accept_mux_clients(
                     fd,
                     ClientMuxState {
                         stream,
-                        in_buf: Vec::with_capacity(4096),
-                        out_buf: Vec::new(),
+                        in_buf: RingBuffer::with_capacity(MAX_IN_BUF_BYTES_PER_CLIENT),
+                        out_buf: RingBuffer::with_capacity(MAX_OUT_BUF_BYTES_PER_CLIENT),
                         binding: None,
+                        peer_addr: Some(addr.to_string()),
+                        last_from_client_ms: None,
+                        last_to_client_ms: None,
                     },
                 );
                 info!("accepted mux client fd={fd} from {addr}");
@@ -1114,7 +1410,7 @@ fn process_mux_client_read(
             let read_len = room.min(tmp.len());
             match client.stream.read(&mut tmp[..read_len]) {
                 Ok(0) => bail!("peer closed"),
-                Ok(n) => client.in_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => client.in_buf.push_slice(&tmp[..n])?,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err.into()),
             }
@@ -1122,16 +1418,29 @@ fn process_mux_client_read(
 
         let mut consumed = 0usize;
         while consumed < client.in_buf.len() {
-            let kind = client.in_buf[consumed];
+            let kind = client
+                .in_buf
+                .peek_u8(consumed)
+                .ok_or_else(|| anyhow!("ring buffer peek failed"))?;
             match kind {
                 CTRL_REGISTER => {
                     if client.in_buf.len() < consumed + 4 {
                         break;
                     }
-                    let name_len = client.in_buf[consumed + 1] as usize;
+                    let name_len = client
+                        .in_buf
+                        .peek_u8(consumed + 1)
+                        .ok_or_else(|| anyhow!("ring buffer peek failed"))?
+                        as usize;
                     let token_len = u16::from_be_bytes([
-                        client.in_buf[consumed + 2],
-                        client.in_buf[consumed + 3],
+                        client
+                            .in_buf
+                            .peek_u8(consumed + 2)
+                            .ok_or_else(|| anyhow!("ring buffer peek failed"))?,
+                        client
+                            .in_buf
+                            .peek_u8(consumed + 3)
+                            .ok_or_else(|| anyhow!("ring buffer peek failed"))?,
                     ]) as usize;
                     let msg_len = 1 + 1 + 2 + name_len + token_len + 6;
                     if client.in_buf.len() < consumed + msg_len {
@@ -1141,11 +1450,13 @@ fn process_mux_client_read(
                     let name_end = name_start + name_len;
                     let token_end = name_end + token_len;
                     let switch_name =
-                        String::from_utf8_lossy(&client.in_buf[name_start..name_end]).to_string();
+                        String::from_utf8_lossy(&client.in_buf.copy_vec(name_start, name_len)?)
+                            .to_string();
                     let token =
-                        String::from_utf8_lossy(&client.in_buf[name_end..token_end]).to_string();
+                        String::from_utf8_lossy(&client.in_buf.copy_vec(name_end, token_len)?)
+                            .to_string();
                     let mut mac = [0u8; 6];
-                    mac.copy_from_slice(&client.in_buf[token_end..token_end + 6]);
+                    client.in_buf.copy_out(token_end, &mut mac)?;
                     parsed.push(ParsedMsg::Register {
                         switch_name,
                         token,
@@ -1158,8 +1469,14 @@ fn process_mux_client_read(
                         break;
                     }
                     let len = u16::from_be_bytes([
-                        client.in_buf[consumed + 1],
-                        client.in_buf[consumed + 2],
+                        client
+                            .in_buf
+                            .peek_u8(consumed + 1)
+                            .ok_or_else(|| anyhow!("ring buffer peek failed"))?,
+                        client
+                            .in_buf
+                            .peek_u8(consumed + 2)
+                            .ok_or_else(|| anyhow!("ring buffer peek failed"))?,
                     ]) as usize;
                     if len == 0 || len > ETH_MAX_FRAME {
                         bail!("invalid mux frame length {len}");
@@ -1169,7 +1486,7 @@ fn process_mux_client_read(
                         break;
                     }
                     let frame_start = consumed + 3;
-                    let frame = client.in_buf[frame_start..frame_start + len].to_vec();
+                    let frame = client.in_buf.copy_vec(frame_start, len)?;
                     parsed.push(ParsedMsg::Data { frame });
                     consumed += msg_len;
                 }
@@ -1177,7 +1494,7 @@ fn process_mux_client_read(
             }
         }
         if consumed > 0 {
-            client.in_buf.drain(..consumed);
+            client.in_buf.consume(consumed)?;
         }
     }
 
@@ -1230,6 +1547,7 @@ fn process_mux_client_read(
                     client.binding.replace(ClientBinding {
                         server_switch_id,
                         mac,
+                        assigned_ipv4: grant.assigned_ipv4.clone(),
                         crypto: grant.crypto,
                     })
                 };
@@ -1254,7 +1572,7 @@ fn process_mux_client_read(
                 }
                 update_peer_register(control, &switch_name, mac, grant.assigned_ip);
                 if let Some(client) = clients.get_mut(&fd) {
-                    client.out_buf.push(CTRL_ACK);
+                    client.out_buf.push_u8(CTRL_ACK)?;
                     epoll_mod(epfd, fd, mux_client_interest(client))?;
                 }
             }
@@ -1293,6 +1611,10 @@ fn process_mux_client_read(
                         );
                         continue;
                     }
+                }
+
+                if let Some(client) = clients.get_mut(&fd) {
+                    client.last_from_client_ms = Some(unix_now_ms());
                 }
 
                 route_frame_mux(
@@ -1495,19 +1817,22 @@ fn enqueue_frame_mux(
         );
         return Ok(());
     }
-    client.out_buf.push(CTRL_DATA);
-    client.out_buf.extend_from_slice(&len.to_be_bytes());
-    client.out_buf.extend_from_slice(&payload);
+    client.out_buf.push_u8(CTRL_DATA)?;
+    client.out_buf.push_slice(&len.to_be_bytes())?;
+    client.out_buf.push_slice(&payload)?;
+    client.last_to_client_ms = Some(unix_now_ms());
     epoll_mod(epfd, fd, mux_client_interest(client))?;
     Ok(())
 }
 
 fn flush_mux_client(client: &mut ClientMuxState) -> Result<()> {
     while !client.out_buf.is_empty() {
-        match client.stream.write(&client.out_buf) {
+        let (first, second) = client.out_buf.head_slices();
+        let bufs = [IoSlice::new(first), IoSlice::new(second)];
+        match client.stream.write_vectored(&bufs) {
             Ok(0) => bail!("socket closed while writing"),
             Ok(n) => {
-                client.out_buf.drain(..n);
+                client.out_buf.consume(n)?;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err.into()),
@@ -1663,6 +1988,7 @@ fn validate_join_token(
     let Some(secret) = state.jwt_secret.as_deref() else {
         return Ok(JoinGrantInfo {
             assigned_ip: None,
+            assigned_ipv4: None,
             crypto: None,
         });
     };
@@ -1719,6 +2045,7 @@ fn validate_join_token(
     );
     Ok(JoinGrantInfo {
         assigned_ip: Some(assigned_ip),
+        assigned_ipv4: Some(claims.ipv4),
         crypto,
     })
 }
@@ -1763,68 +2090,92 @@ fn build_rpc_authz_state(
     let mut known_groups: HashSet<String> = HashSet::new();
     if let Some(groups) = cfg.groups.as_ref() {
         for g in groups {
-            let name = g.name.trim();
+            let name = g.name.trim().to_lowercase();
             if name.is_empty() {
                 bail!("group name must not be empty");
             }
-            if !known_groups.insert(name.to_string()) {
+            if !known_groups.insert(name.clone()) {
                 bail!("duplicate group name: {name}");
             }
         }
     }
+    // Built-in implicit group for admin UI authorization.
+    known_groups.insert("admin".to_string());
 
     let mut known_principals: HashSet<String> = HashSet::new();
-    let mut credentials: HashMap<String, AuthCredential> = HashMap::new();
-    let mut principal_groups: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut api_credentials: HashMap<String, ApiAuthCredential> = HashMap::default();
+    let mut web_logins: HashMap<String, WebLoginCredential> = HashMap::default();
+    let mut principal_groups: HashMap<String, HashSet<String>> = HashMap::default();
     for p in principals {
-        let principal_name = p.name.trim();
+        let principal_name = p.name.trim().to_lowercase();
         if principal_name.is_empty() {
             bail!("principal name must not be empty");
         }
-        if !known_principals.insert(principal_name.to_string()) {
+        if !known_principals.insert(principal_name.clone()) {
             bail!("duplicate principal name: {principal_name}");
         }
-        if p.api_credentials.is_empty() {
-            bail!("principal {principal_name} must define at least one api_credentials entry");
+        if p.credentials.api_keys.is_empty() && p.credentials.web_logins.is_empty() {
+            bail!("principal {principal_name} must define at least one credentials entry");
         }
 
         let mut groups_for_principal: HashSet<String> = HashSet::new();
         if let Some(groups) = p.groups.as_ref() {
             for group_name in groups {
-                let group_name = group_name.trim();
+                let group_name = group_name.trim().to_lowercase();
                 if group_name.is_empty() {
                     bail!("principal {principal_name} has empty group membership");
                 }
-                if !known_groups.contains(group_name) {
+                if !known_groups.contains(&group_name) {
                     bail!("principal {principal_name} references unknown group {group_name}");
                 }
-                groups_for_principal.insert(group_name.to_string());
+                groups_for_principal.insert(group_name);
             }
         }
-        principal_groups.insert(principal_name.to_string(), groups_for_principal);
+        principal_groups.insert(principal_name.clone(), groups_for_principal);
 
-        for cred in &p.api_credentials {
-            let key = cred.api_key.trim();
-            let secret = cred.api_secret.trim();
+        for cred in &p.credentials.api_keys {
+            let (key, secret) = cred
+                .split_once(':')
+                .ok_or_else(|| anyhow!("principal {principal_name} has invalid api_keys entry"))?;
+            let key = key.trim();
+            let secret = secret.trim();
             if key.is_empty() || secret.is_empty() {
-                bail!(
-                    "principal {principal_name} has empty api_key/api_secret in api_credentials"
-                );
+                bail!("principal {principal_name} has empty api key/secret in api_keys");
             }
-            if credentials.contains_key(key) {
-                bail!("duplicate api_key across principals: {key}");
+            if api_credentials.contains_key(key) {
+                panic!("duplicate api_key across principals: {key}");
             }
-            credentials.insert(
+            api_credentials.insert(
                 key.to_string(),
-                AuthCredential {
-                    principal: principal_name.to_string(),
+                ApiAuthCredential {
+                    principal: principal_name.clone(),
                     api_secret: secret.to_string(),
+                },
+            );
+        }
+        for login in &p.credentials.web_logins {
+            let (username, password_hash) = login.split_once(':').ok_or_else(|| {
+                anyhow!("principal {principal_name} has invalid web_logins entry")
+            })?;
+            let username = username.trim().to_lowercase();
+            let password_hash = password_hash.trim();
+            if username.is_empty() || password_hash.is_empty() {
+                bail!("principal {principal_name} has empty username/password hash in web_logins");
+            }
+            if web_logins.contains_key(&username) {
+                panic!("duplicate web login username across principals: {username}");
+            }
+            web_logins.insert(
+                username,
+                WebLoginCredential {
+                    principal: principal_name.clone(),
+                    password_hash: password_hash.to_string(),
                 },
             );
         }
     }
 
-    let mut switch_acl: HashMap<String, SwitchJoinAcl> = HashMap::new();
+    let mut switch_acl: HashMap<String, SwitchJoinAcl> = HashMap::default();
     if let Some(rules) = cfg.acl.as_ref() {
         for rule in rules {
             let switch_name = rule.switch.trim();
@@ -1841,30 +2192,30 @@ fn build_rpc_authz_state(
             let mut acl_principals: HashSet<String> = HashSet::new();
             if let Some(entries) = rule.principals.as_ref() {
                 for principal in entries {
-                    let principal = principal.trim();
+                    let principal = principal.trim().to_lowercase();
                     if principal.is_empty() {
                         bail!("acl for switch {switch_name} has empty principal entry");
                     }
-                    if !known_principals.contains(principal) {
+                    if !known_principals.contains(&principal) {
                         bail!(
                             "acl for switch {switch_name} references unknown principal: {principal}"
                         );
                     }
-                    acl_principals.insert(principal.to_string());
+                    acl_principals.insert(principal);
                 }
             }
 
             let mut acl_groups: HashSet<String> = HashSet::new();
             if let Some(entries) = rule.groups.as_ref() {
                 for group in entries {
-                    let group = group.trim();
+                    let group = group.trim().to_lowercase();
                     if group.is_empty() {
                         bail!("acl for switch {switch_name} has empty group entry");
                     }
-                    if !known_groups.contains(group) {
+                    if !known_groups.contains(&group) {
                         bail!("acl for switch {switch_name} references unknown group: {group}");
                     }
-                    acl_groups.insert(group.to_string());
+                    acl_groups.insert(group);
                 }
             }
 
@@ -1882,10 +2233,31 @@ fn build_rpc_authz_state(
         }
     }
 
+    let mut admin_groups: HashSet<String> = HashSet::new();
+    let configured_admin_groups = match cfg.admin_groups.clone() {
+        Some(v) if !v.is_empty() => v,
+        _ => vec!["admin".to_string()],
+    };
+    for group_name in configured_admin_groups {
+        let group_name = group_name.trim().to_lowercase();
+        if group_name.is_empty() {
+            bail!("admin_groups contains empty group name");
+        }
+        if !known_groups.contains(&group_name) {
+            bail!("admin_groups references unknown group: {group_name}");
+        }
+        admin_groups.insert(group_name);
+    }
+    if admin_groups.is_empty() {
+        bail!("admin_groups resolution produced empty set");
+    }
+
     Ok(Some(RpcAuthzState {
-        credentials,
+        api_credentials,
+        web_logins,
         principal_groups,
         switch_acl,
+        admin_groups,
         has_acl_rules: cfg.acl.is_some(),
     }))
 }
@@ -1896,10 +2268,28 @@ fn run_rpc_server(bind: String, state: RpcState) -> Result<()> {
         .build()
         .context("failed to build tokio runtime for rpc")?;
     rt.block_on(async move {
+        let admin_routes = Router::new()
+            .route(
+                "/vswitch/admin/login",
+                get(admin_login_page).post(admin_login_submit),
+            )
+            .route("/vswitch/admin/logout", get(admin_logout))
+            .route("/vswitch/admin", get(admin_dashboard))
+            .route("/vswitch/admin/switches/{name}", get(admin_switch_detail))
+            .route("/vswitch/admin/reservations", get(admin_reservations))
+            .route("/vswitch/admin/server-routes", get(admin_server_routes))
+            .route("/vswitch/admin/client-routes", get(admin_client_routes))
+            .route("/vswitch/admin/bridges", get(admin_bridges))
+            .route("/vswitch/admin/networks", get(admin_networks))
+            .route("/vswitch/admin/assets/app.css", get(admin_asset_css))
+            .route("/vswitch/admin/assets/app.js", get(admin_asset_js))
+            .layer(middleware::from_fn(admin_security_headers_middleware));
+
         let app = Router::new()
             .route("/vswitch/switches/list", get(rpc_list_switches))
             .route("/vswitch/switches/{name}/join", get(rpc_join_switch))
             .route("/vswitch/switches/{name}/peers", get(rpc_list_peers))
+            .merge(admin_routes)
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
@@ -2023,7 +2413,7 @@ fn authenticate_principal(
         .parse::<u64>()
         .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?;
     let cred = authz
-        .credentials
+        .api_credentials
         .get(&api_key)
         .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
     let msg = format!("{query_string}{nonce}{ts_ms}");
@@ -2035,19 +2425,107 @@ fn authenticate_principal(
 }
 
 fn can_principal_join_switch(authz: &RpcAuthzState, principal: &str, switch_name: &str) -> bool {
+    let principal = principal.to_lowercase();
+    // Built-in admin group is a global ACL bypass.
+    if authz
+        .principal_groups
+        .get(&principal)
+        .is_some_and(|groups| groups.contains("admin"))
+    {
+        return true;
+    }
     if !authz.has_acl_rules {
         return true;
     }
     let Some(rule) = authz.switch_acl.get(switch_name) else {
         return false;
     };
-    if rule.principals.contains(principal) {
+    if rule.principals.contains(&principal) {
         return true;
     }
     authz
         .principal_groups
-        .get(principal)
+        .get(&principal)
         .is_some_and(|groups| groups.iter().any(|g| rule.groups.contains(g)))
+}
+
+fn can_principal_access_admin(authz: &RpcAuthzState, principal: &str) -> bool {
+    let principal = principal.to_lowercase();
+    authz
+        .principal_groups
+        .get(&principal)
+        .is_some_and(|groups| groups.iter().any(|g| authz.admin_groups.contains(g)))
+}
+
+fn parse_cookie(headers: &HeaderMap, key: &str) -> Option<String> {
+    let cookie_header = headers.get(COOKIE)?.to_str().ok()?;
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        if let Some((k, v)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+fn create_admin_session(state: &RpcState, principal: &str) -> Result<String, axum::http::StatusCode> {
+    let mut raw = [0u8; 32];
+    fill_random_bytes(&mut raw).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sid = hex_encode(&raw);
+    let now_ms = unix_now_ms();
+    let mut sessions = state
+        .admin_sessions
+        .lock()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    sessions.retain(|_, sess| sess.expires_at_ms > now_ms);
+    sessions.insert(
+        sid.clone(),
+        AdminSession {
+            principal: principal.to_string(),
+            expires_at_ms: now_ms.saturating_add(ADMIN_SESSION_TTL_MS),
+        },
+    );
+    Ok(sid)
+}
+
+fn authenticate_admin_session(
+    headers: &HeaderMap,
+    state: &RpcState,
+) -> Result<String, axum::http::StatusCode> {
+    let authz = state
+        .authz
+        .as_ref()
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    let sid = parse_cookie(headers, "vswitch_admin_session")
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    let now_ms = unix_now_ms();
+    let mut sessions = state
+        .admin_sessions
+        .lock()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    sessions.retain(|_, sess| sess.expires_at_ms > now_ms);
+    let session = sessions
+        .get_mut(&sid)
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    if !can_principal_access_admin(authz, &session.principal) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    // Sliding expiration.
+    session.expires_at_ms = now_ms.saturating_add(ADMIN_SESSION_TTL_MS);
+    Ok(session.principal.clone())
+}
+
+async fn fetch_admin_snapshot(state: &RpcState) -> Result<AdminSnapshot, axum::http::StatusCode> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .cmd_tx
+        .send(ControlPlaneCmd::AdminSnapshot { resp: tx })
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    signal_eventfd(state.event_fd).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    rx.await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn rpc_list_switches(
@@ -2176,9 +2654,526 @@ async fn rpc_list_peers(
     Ok(Json(PeersResponse { switch: name, peers }))
 }
 
+const ADMIN_SHELL_HTML: &[u8] = include_bytes!("../templates/admin/shell.html");
+const ADMIN_LOGIN_HTML: &[u8] = include_bytes!("../templates/admin/login.html");
+const ADMIN_DASHBOARD_HTML: &[u8] = include_bytes!("../templates/admin/dashboard.html");
+const ADMIN_SWITCH_DETAIL_HTML: &[u8] = include_bytes!("../templates/admin/switch_detail.html");
+const ADMIN_RESERVATIONS_HTML: &[u8] = include_bytes!("../templates/admin/reservations.html");
+const ADMIN_ROUTES_HTML: &[u8] = include_bytes!("../templates/admin/routes.html");
+const ADMIN_BRIDGES_HTML: &[u8] = include_bytes!("../templates/admin/bridges.html");
+const ADMIN_NETWORKS_HTML: &[u8] = include_bytes!("../templates/admin/networks.html");
+const ADMIN_CSS: &[u8] = include_bytes!("../templates/admin/app.css");
+const ADMIN_JS: &[u8] = include_bytes!("../templates/admin/app.js");
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn embedded_utf8(bytes: &'static [u8], name: &str) -> String {
+    std::str::from_utf8(bytes)
+        .unwrap_or_else(|_| panic!("embedded template is not utf-8: {name}"))
+        .to_string()
+}
+
+fn render_template(mut template: String, vars: &[(&str, String)]) -> String {
+    for (key, value) in vars {
+        let needle = format!("{{{{{}}}}}", key);
+        template = template.replace(&needle, value);
+    }
+    template
+}
+
+fn build_bridge_tree_html(snapshot: &AdminSnapshot) -> String {
+    if snapshot.bridges.is_empty() {
+        return "<div class=\"tree-empty\">No bridges configured</div>".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("<div class=\"tree\"><ul>");
+    for bridge in &snapshot.bridges {
+        out.push_str("<li><span class=\"node bridge\">");
+        out.push_str(&html_escape(&bridge.name));
+        out.push_str("</span>");
+        if bridge.members.is_empty() {
+            out.push_str("<ul><li><span class=\"tree-empty\">(no members)</span></li></ul>");
+        } else {
+            out.push_str("<ul>");
+            for member in &bridge.members {
+                out.push_str("<li><span class=\"node switch\">");
+                out.push_str(&html_escape(member));
+                out.push_str("</span></li>");
+            }
+            out.push_str("</ul>");
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul></div>");
+    out
+}
+
+fn admin_nav() -> &'static str {
+    r#"<div class="nav">
+<a href="/vswitch/admin">Dashboard</a>
+<a href="/vswitch/admin/bridges">Bridges</a>
+<a href="/vswitch/admin/networks">Networks</a>
+<a href="/vswitch/admin/logout">Logout</a>
+</div>"#
+}
+
+fn render_admin_shell(title: &str, principal: Option<&str>, body: String) -> Html<String> {
+    let principal_html = principal
+        .map(|p| format!(r#"<div class="sub">Signed in as <b>{}</b></div>"#, html_escape(p)))
+        .unwrap_or_else(|| r#"<div class="sub">Authentication required</div>"#.to_string());
+    let html = render_template(
+        embedded_utf8(ADMIN_SHELL_HTML, "shell.html"),
+        &[
+            ("title", html_escape(title)),
+            ("principal_html", principal_html),
+            (
+                "nav_html",
+                if principal.is_some() {
+                    admin_nav().to_string()
+                } else {
+                    String::new()
+                },
+            ),
+            ("body", body),
+        ],
+    );
+    Html(html)
+}
+
+fn render_admin_forbidden_page() -> Html<String> {
+    let body = r#"
+<div class="login-wrap">
+  <div class="card">
+    <h1 class="title">Admin Access Required</h1>
+    <p class="muted">You are authenticated but not in an allowed admin group.</p>
+    <div class="alert">Please log in using an account that belongs to an admin group.</div>
+    <p class="mb14"><a class="btn" href="/vswitch/admin/logout">Logout</a></p>
+  </div>
+</div>
+"#
+    .to_string();
+    render_admin_shell("admin access required", None, body)
+}
+
+async fn admin_asset_css() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        embedded_utf8(ADMIN_CSS, "app.css"),
+    )
+}
+
+async fn admin_asset_js() -> impl IntoResponse {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        embedded_utf8(ADMIN_JS, "app.js"),
+    )
+}
+
+async fn admin_security_headers_middleware(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut res = next.run(req).await;
+    if res.status() == axum::http::StatusCode::UNAUTHORIZED {
+        res = Redirect::to("/vswitch/admin/login").into_response();
+    } else if res.status() == axum::http::StatusCode::FORBIDDEN {
+        res = render_admin_forbidden_page().into_response();
+    }
+    // Strict CSP without inline script/style.
+    res.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    res.headers_mut()
+        .insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    res.headers_mut()
+        .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    res.headers_mut().insert(
+        "referrer-policy",
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
+
+fn render_admin_login_body(error: Option<&str>) -> String {
+    let error_html = error
+        .map(|msg| format!(r#"<div class="alert mb14">{}</div>"#, html_escape(msg)))
+        .unwrap_or_default();
+    render_template(
+        embedded_utf8(ADMIN_LOGIN_HTML, "login.html"),
+        &[("error_html", error_html)],
+    )
+}
+
+async fn admin_login_page() -> Html<String> {
+    let body = render_admin_login_body(None);
+    render_admin_shell("vswitch admin login", None, body)
+}
+
+async fn admin_login_submit(
+    State(state): State<RpcState>,
+    Form(form): Form<AdminLoginForm>,
+) -> Result<Response, axum::http::StatusCode> {
+    let authz = state
+        .authz
+        .as_ref()
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    let username = form.username.trim().to_lowercase();
+    let Some(login) = authz.web_logins.get(&username) else {
+        let body = render_admin_login_body(Some("Invalid username or password."));
+        return Ok(render_admin_shell("vswitch admin login", None, body).into_response());
+    };
+    let verified = verify_bcrypt(&form.password, &login.password_hash).unwrap_or(false);
+    if !verified {
+        let body = render_admin_login_body(Some("Invalid username or password."));
+        return Ok(render_admin_shell("vswitch admin login", None, body).into_response());
+    }
+    if !can_principal_access_admin(authz, &login.principal) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    let sid = create_admin_session(&state, &login.principal)?;
+    let cookie = format!(
+        "vswitch_admin_session={sid}; HttpOnly; Path=/; Max-Age={}; SameSite=Lax",
+        ADMIN_SESSION_TTL_MS / 1000
+    );
+    let cookie_header =
+        HeaderValue::from_str(&cookie).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(([(SET_COOKIE, cookie_header)], Redirect::to("/vswitch/admin")).into_response())
+}
+
+async fn admin_logout(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, axum::http::StatusCode> {
+    if let Some(sid) = parse_cookie(&headers, "vswitch_admin_session")
+        && let Ok(mut sessions) = state.admin_sessions.lock()
+    {
+        sessions.remove(&sid);
+    }
+    let cookie =
+        "vswitch_admin_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax".to_string();
+    let cookie_header =
+        HeaderValue::from_str(&cookie).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((
+        [(SET_COOKIE, cookie_header)],
+        Redirect::to("/vswitch/admin/login"),
+    ))
+}
+
+async fn admin_dashboard(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let total_clients: usize = snapshot.switches.iter().map(|s| s.clients.len()).sum();
+    let total_resv: usize = snapshot
+        .switches
+        .iter()
+        .map(|s| s.address_reservations.len())
+        .sum();
+    let mut switch_to_bridge: HashMap<String, String> = HashMap::default();
+    for bridge in &snapshot.bridges {
+        for member in &bridge.members {
+            switch_to_bridge.insert(member.clone(), bridge.name.clone());
+        }
+    }
+    let bridge_tree = build_bridge_tree_html(&snapshot);
+    let switch_rows = snapshot
+        .switches
+        .iter()
+        .map(|sw| format!(
+            "<tr><td><a href=\"/vswitch/admin/switches/{n}\">{n}</a></td><td>{bridge}</td><td>{tap}</td><td>{cidr}</td><td>{hip}</td><td>{cc}</td></tr>",
+            n = html_escape(&sw.name),
+            bridge = html_escape(
+                switch_to_bridge
+                    .get(&sw.name)
+                    .map(String::as_str)
+                    .unwrap_or("-")
+            ),
+            tap = html_escape(&sw.tap),
+            cidr = html_escape(sw.cidr.as_deref().unwrap_or("-")),
+            hip = html_escape(sw.host_ip.as_deref().unwrap_or("-")),
+            cc = sw.clients.len()
+        ))
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_DASHBOARD_HTML, "dashboard.html"),
+        &[
+            ("generated_at_ms", snapshot.generated_at_ms.to_string()),
+            ("switches_count", snapshot.switches.len().to_string()),
+            ("clients_count", total_clients.to_string()),
+            ("reservations_count", total_resv.to_string()),
+            ("bridges_count", snapshot.bridges.len().to_string()),
+            ("bridge_tree_html", bridge_tree),
+            ("switch_rows", switch_rows),
+        ],
+    );
+    Ok(render_admin_shell("vswitch admin", Some(&principal), body))
+}
+
+async fn admin_switch_detail(
+    AxumPath(name): AxumPath<String>,
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let sw = snapshot
+        .switches
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let client_rows = sw
+        .clients
+        .iter()
+        .map(|c| format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(&c.mac),
+            html_escape(c.source_addr.as_deref().unwrap_or("-")),
+            html_escape(c.assigned_ip.as_deref().unwrap_or("-")),
+            html_escape(c.assigned_network.as_deref().unwrap_or("-")),
+            c.last_packet_from_client_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            c.last_packet_to_client_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ))
+        .collect::<String>();
+    let server_route_rows = if sw.server_routes.is_empty() {
+        "<tr><td colspan=\"2\" class=\"muted\">No server routes</td></tr>".to_string()
+    } else {
+        sw.server_routes
+            .iter()
+            .map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td></tr>",
+                    html_escape(&r.to),
+                    html_escape(r.via.as_deref().unwrap_or("on-link"))
+                )
+            })
+            .collect::<String>()
+    };
+    let client_route_rows = if sw.client_routes.is_empty() {
+        "<tr><td colspan=\"2\" class=\"muted\">No client routes</td></tr>".to_string()
+    } else {
+        sw.client_routes
+            .iter()
+            .map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td></tr>",
+                    html_escape(&r.to),
+                    html_escape(r.via.as_deref().unwrap_or("on-link"))
+                )
+            })
+            .collect::<String>()
+    };
+    let reservation_rows = if sw.address_reservations.is_empty() {
+        "<tr><td colspan=\"2\" class=\"muted\">No address reservations</td></tr>".to_string()
+    } else {
+        sw.address_reservations
+            .iter()
+            .map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td></tr>",
+                    html_escape(&r.mac),
+                    html_escape(&r.ipv4),
+                )
+            })
+            .collect::<String>()
+    };
+    let body = render_template(
+        embedded_utf8(ADMIN_SWITCH_DETAIL_HTML, "switch_detail.html"),
+        &[
+            ("switch_name", html_escape(&sw.name)),
+            ("tap", html_escape(&sw.tap)),
+            ("host_mac", html_escape(&sw.host_mac)),
+            ("host_ip", html_escape(sw.host_ip.as_deref().unwrap_or("-"))),
+            ("cidr", html_escape(sw.cidr.as_deref().unwrap_or("-"))),
+            ("client_rows", client_rows),
+            ("server_route_rows", server_route_rows),
+            ("client_route_rows", client_route_rows),
+            ("reservation_rows", reservation_rows),
+        ],
+    );
+    Ok(render_admin_shell(
+        &format!("switch {}", sw.name),
+        Some(&principal),
+        body,
+    ))
+}
+
+async fn admin_reservations(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let rows = snapshot
+        .switches
+        .iter()
+        .flat_map(|sw| {
+            sw.address_reservations.iter().map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    html_escape(&sw.name),
+                    html_escape(&r.mac),
+                    html_escape(&r.ipv4),
+                )
+            })
+        })
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_RESERVATIONS_HTML, "reservations.html"),
+        &[("rows", rows)],
+    );
+    Ok(render_admin_shell("reservations", Some(&principal), body))
+}
+
+async fn admin_server_routes(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let rows = snapshot
+        .switches
+        .iter()
+        .flat_map(|sw| {
+            sw.server_routes.iter().map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    html_escape(&sw.name),
+                    html_escape(&r.to),
+                    html_escape(r.via.as_deref().unwrap_or("on-link")),
+                )
+            })
+        })
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_ROUTES_HTML, "routes.html"),
+        &[
+            ("title", "Server routes".to_string()),
+            ("table_id", "tbl-sroutes".to_string()),
+            ("rows", rows),
+        ],
+    );
+    Ok(render_admin_shell("server routes", Some(&principal), body))
+}
+
+async fn admin_client_routes(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let rows = snapshot
+        .switches
+        .iter()
+        .flat_map(|sw| {
+            sw.client_routes.iter().map(|r| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    html_escape(&sw.name),
+                    html_escape(&r.to),
+                    html_escape(r.via.as_deref().unwrap_or("on-link")),
+                )
+            })
+        })
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_ROUTES_HTML, "routes.html"),
+        &[
+            ("title", "Client routes".to_string()),
+            ("table_id", "tbl-croutes".to_string()),
+            ("rows", rows),
+        ],
+    );
+    Ok(render_admin_shell("client routes", Some(&principal), body))
+}
+
+async fn admin_bridges(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let rows = snapshot
+        .bridges
+        .iter()
+        .map(|b| format!(
+            "<tr><td>{}</td><td>{}</td></tr>",
+            html_escape(&b.name),
+            html_escape(&b.members.join(", ")),
+        ))
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_BRIDGES_HTML, "bridges.html"),
+        &[("rows", rows)],
+    );
+    Ok(render_admin_shell("bridges", Some(&principal), body))
+}
+
+async fn admin_networks(
+    State(state): State<RpcState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    let principal = authenticate_admin_session(&headers, &state)?;
+    let snapshot = fetch_admin_snapshot(&state).await?;
+    let mut switch_to_bridge: HashMap<String, String> = HashMap::default();
+    for bridge in &snapshot.bridges {
+        for member in &bridge.members {
+            switch_to_bridge.insert(member.clone(), bridge.name.clone());
+        }
+    }
+    let bridge_tree = build_bridge_tree_html(&snapshot);
+    let rows = snapshot
+        .switches
+        .iter()
+        .map(|sw| format!(
+            "<tr><td><a href=\"/vswitch/admin/switches/{name}\">{name}</a></td><td>{bridge}</td><td>{cidr}</td><td>{host_ip}</td><td>{host_mac}</td><td>{tap}</td></tr>",
+            name = html_escape(&sw.name),
+            bridge = html_escape(
+                switch_to_bridge
+                    .get(&sw.name)
+                    .map(String::as_str)
+                    .unwrap_or("-")
+            ),
+            cidr = html_escape(sw.cidr.as_deref().unwrap_or("-")),
+            host_ip = html_escape(sw.host_ip.as_deref().unwrap_or("-")),
+            host_mac = html_escape(&sw.host_mac),
+            tap = html_escape(&sw.tap),
+        ))
+        .collect::<String>();
+    let body = render_template(
+        embedded_utf8(ADMIN_NETWORKS_HTML, "networks.html"),
+        &[("bridge_tree_html", bridge_tree), ("rows", rows)],
+    );
+    Ok(render_admin_shell("networks", Some(&principal), body))
+}
+
 fn process_control_plane_cmds(
     control: &mut ControlPlaneState,
     rx: &mpsc::Receiver<ControlPlaneCmd>,
+    switches: &HashMap<u16, ServerSwitchState>,
+    clients: &HashMap<RawFd, ClientMuxState>,
+    bridges: &[BridgeState],
 ) -> Result<()> {
     loop {
         match rx.try_recv() {
@@ -2210,11 +3205,93 @@ fn process_control_plane_cmds(
                     let _ = resp.send(Ok(peers));
                 }
             }
+            Ok(ControlPlaneCmd::AdminSnapshot { resp }) => {
+                let _ = resp.send(build_admin_snapshot(control, switches, clients, bridges));
+            }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
     }
     Ok(())
+}
+
+fn build_admin_snapshot(
+    control: &ControlPlaneState,
+    switches: &HashMap<u16, ServerSwitchState>,
+    clients: &HashMap<RawFd, ClientMuxState>,
+    bridges: &[BridgeState],
+) -> AdminSnapshot {
+    let mut switch_rows: Vec<AdminSwitchSnapshot> = Vec::new();
+    for sw_view in control.switches.values() {
+        let mut switch_clients: Vec<AdminClientSnapshot> = Vec::new();
+        let switch_id = switches
+            .iter()
+            .find_map(|(id, sw)| (sw.name == sw_view.name).then_some(*id));
+        if let Some(sid) = switch_id {
+            for client in clients.values() {
+                if let Some(binding) = client.binding.as_ref()
+                    && binding.server_switch_id == sid
+                {
+                    let assigned_ip = binding
+                        .assigned_ipv4
+                        .as_deref()
+                        .map(|v| v.split('/').next().unwrap_or(v).to_string());
+                    switch_clients.push(AdminClientSnapshot {
+                        mac: format_mac(&binding.mac),
+                        source_addr: client.peer_addr.clone(),
+                        assigned_ip,
+                        assigned_network: binding.assigned_ipv4.clone(),
+                        last_packet_from_client_ms: client.last_from_client_ms,
+                        last_packet_to_client_ms: client.last_to_client_ms,
+                    });
+                }
+            }
+        }
+        switch_clients.sort_by(|a, b| a.mac.cmp(&b.mac));
+
+        let mut reservations: Vec<AdminReservationSnapshot> = sw_view
+            .address_reservations
+            .iter()
+            .map(|(mac, v)| AdminReservationSnapshot {
+                mac: mac.clone(),
+                ipv4: v.ip.to_string(),
+            })
+            .collect();
+        reservations.sort_by(|a, b| a.mac.cmp(&b.mac));
+
+        switch_rows.push(AdminSwitchSnapshot {
+            name: sw_view.name.clone(),
+            tap: sw_view.tap.clone(),
+            host_ip: sw_view.host_ip.clone(),
+            cidr: sw_view.cidr.clone(),
+            host_mac: sw_view.host_mac.clone(),
+            server_routes: sw_view.server_routes.clone(),
+            client_routes: sw_view.client_routes.clone(),
+            address_reservations: reservations,
+            clients: switch_clients,
+        });
+    }
+    switch_rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut bridge_rows = Vec::new();
+    for bridge in bridges {
+        let mut members: Vec<String> = bridge
+            .members
+            .iter()
+            .filter_map(|sid| switches.get(sid).map(|sw| sw.name.clone()))
+            .collect();
+        members.sort();
+        bridge_rows.push(AdminBridgeSnapshot {
+            name: bridge.name.clone(),
+            members,
+        });
+    }
+
+    AdminSnapshot {
+        generated_at_ms: unix_now_ms(),
+        switches: switch_rows,
+        bridges: bridge_rows,
+    }
 }
 
 fn issue_join_token(
@@ -2224,6 +3301,7 @@ fn issue_join_token(
     principal: &str,
     requested_ip: Option<&str>,
 ) -> std::result::Result<JoinResponse, i32> {
+    let principal = principal.to_lowercase();
     prune_grants(control);
     if control.crypto_method != "AES-GCM-256" {
         return Err(503);
@@ -2248,7 +3326,7 @@ fn issue_join_token(
     let claims = JoinClaims {
         iat: now,
         exp: now + 60,
-        principal: principal.to_string(),
+        principal,
         switch: switch_name.to_string(),
         mac: format_mac(&req_mac),
         ipv4: assigned_ipv4,
@@ -2622,24 +3700,8 @@ fn write_error_msg_best_effort(
     }
 }
 
-fn parse_config_arg(args: &[String]) -> Result<Option<String>> {
-    let mut i = 0usize;
-    let mut config_path: Option<String> = None;
-    while i < args.len() {
-        if args[i] == "--config" || args[i] == "-c" {
-            i += 1;
-            if i >= args.len() {
-                bail!("--config/-c needs a value");
-            }
-            config_path = Some(args[i].clone());
-        }
-        i += 1;
-    }
-    Ok(config_path)
-}
-
-fn resolve_config_path(mode: &str, args: &[String]) -> Result<String> {
-    if let Some(path) = parse_config_arg(args)? {
+fn resolve_config_path(mode: &str, config: Option<String>) -> Result<String> {
+    if let Some(path) = config {
         return Ok(path);
     }
 
@@ -3085,6 +4147,16 @@ fn is_server_route_ignored(route: &RouteSpec, ignored_ranges: &[(u32, u32)]) -> 
     Ok(ignored_ranges
         .iter()
         .any(|(ignore_start, ignore_end)| route_start <= *ignore_end && *ignore_start <= route_end))
+}
+
+fn route_via_is_self(route: &RouteSpec, self_ip: Ipv4Addr) -> Result<bool> {
+    let Some(via) = route.via.as_deref() else {
+        return Ok(false);
+    };
+    let via_ip = via
+        .parse::<Ipv4Addr>()
+        .with_context(|| format!("invalid route via: {via}"))?;
+    Ok(via_ip == self_ip)
 }
 
 fn normalize_route(route: &RouteSpec) -> Result<RouteSpec> {
