@@ -393,6 +393,12 @@ If `-c/--config` is omitted, auto-load order:
 
 ## Operational Notes
 
+- **Performance Baseline (example lab run)**
+  - Direct raw path to server: ~`940 Mbps`.
+  - Through `vswitch` tunnel (`iperf3`, both directions): ~`874-879 Mbps` steady-state.
+  - Observed tunnel overhead in this run: about `6-7%`.
+  - Ping to virtual gateway (`172.20.0.1`) after tuning was stable around `33-34 ms`.
+
 - **Auth & ACL Rules**
   - `credentials.api_keys` are for RPC/HMAC clients only.
   - `credentials.web_logins` are for `/vswitch/admin/*` form login only (username + bcrypt hash).
@@ -404,6 +410,8 @@ If `-c/--config` is omitted, auto-load order:
 - Keep `rpc_hmac_secret` and principal `api_secret` values strong and private.
 - Prefer private RPC exposure and/or TLS termination in production.
 - Data plane transport is TCP; payload is encrypted but transport metadata is still visible.
+- Socket tuning in current build includes `TCP_NODELAY` plus best-effort `TCP_QUICKACK` on tunnel sockets.
+- Dataplane buffers use fixed-size ring buffers (input and output) to avoid repeated left-shift compaction.
 - Use explicit `via` where appropriate in routed designs.
 - If client host network already owns a subnet, use `ignore_server_routes` to prevent route hijack through TAP.
 

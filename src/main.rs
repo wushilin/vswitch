@@ -969,13 +969,13 @@ fn run_server_config_mode(path: &str) -> Result<()> {
 
             if let Some(&switch_id) = tap_fd_to_switch.get(&fd) {
                 loop {
-                    let tap_file = {
+                    let read_res = {
                         let sw = switches
                             .get(&switch_id)
                             .ok_or_else(|| anyhow!("missing switch id {switch_id}"))?;
-                        sw.tap.file.try_clone().context("failed to clone TAP fd")?
+                        read_frame_from_tap(&sw.tap.file, &mut tap_buf)
                     };
-                    match read_frame_from_tap(&tap_file, &mut tap_buf) {
+                    match read_res {
                         Ok(Some(frame)) => {
                             route_frame_mux(
                                 epfd,
@@ -1117,6 +1117,7 @@ fn run_client_config_session(cfg: &ClientConfig, sw: &ClientSwitchConfigTop) -> 
     tx_stream
         .set_nodelay(true)
         .context("failed to set TCP_NODELAY")?;
+    set_tcp_quickack_best_effort(&tx_stream);
     configure_tcp_keepalive(&tx_stream, 15, 5, 3)?;
     let mut rx_stream = tx_stream.try_clone().context("failed to clone stream")?;
     let client_ip: Ipv4Addr;
@@ -1413,6 +1414,10 @@ fn accept_mux_clients(
                 stream
                     .set_nonblocking(true)
                     .context("failed to set accepted socket nonblocking")?;
+                stream
+                    .set_nodelay(true)
+                    .context("failed to set TCP_NODELAY on accepted socket")?;
+                set_tcp_quickack_best_effort(&stream);
                 let fd = stream.as_raw_fd();
                 epoll_add(epfd, fd, libc::EPOLLIN as u32)?;
                 clients.insert(
@@ -4104,6 +4109,26 @@ fn configure_tcp_keepalive(
         return Err(io::Error::last_os_error()).context("setsockopt TCP_KEEPCNT failed");
     }
     Ok(())
+}
+
+fn set_tcp_quickack_best_effort(stream: &TcpStream) {
+    let fd = stream.as_raw_fd();
+    let on: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        debug!(
+            "failed to set TCP_QUICKACK (best-effort): {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 fn add_route_via_iface(route: &RouteSpec, if_name: &str) -> Result<()> {
